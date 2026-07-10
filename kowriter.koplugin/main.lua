@@ -186,7 +186,7 @@ function KoWriter:setEnabled(on)
         self.toolbar_buttons = nil
     end
     -- Full repaint so the toolbar and any in-flight ink settle cleanly.
-    UIManager:setDirty(self.view, "ui")
+    self:requestRefresh(true)
 end
 
 -- --- Raw input capture -------------------------------------------------------
@@ -407,6 +407,35 @@ function KoWriter:refreshRegion(x1, y1, x2, y2, width)
     end
 end
 
+-- Repaint the reader (page + our ink + toolbar) straight into the framebuffer
+-- and push it to the panel NOW. UIManager:setDirty does not reliably flush
+-- while our feedEvent hook is swallowing the touch frame, so toolbar/undo/erase
+-- feedback would otherwise not show until the next page turn. This is the same
+-- direct path that already makes live drawing appear.
+function KoWriter:renderNow(flash)
+    if not (self.ui and self.ui.view) then return end
+    self.ui.view:paintTo(Screen.bb, 0, 0)
+    local w, h = Screen:getWidth(), Screen:getHeight()
+    if flash then
+        Screen:refreshFull(0, 0, w, h)   -- flashing: cleanly clears removed ink / toolbar
+    else
+        Screen:refreshUI(0, 0, w, h)
+    end
+end
+
+-- Refresh the right way for the current context. When a menu/dialog is on top
+-- (the action came from the plugin menu), its own close repaints the reader, so
+-- a normal setDirty is correct and avoids painting under the closing menu.
+-- Otherwise we are in the on-page toolbar / input-hook context and must refresh
+-- immediately ourselves.
+function KoWriter:requestRefresh(flash)
+    if self:isOverlayActive() then
+        UIManager:setDirty(self.ui, flash and "full" or "ui")
+    else
+        self:renderNow(flash)
+    end
+end
+
 -- --- Eraser ------------------------------------------------------------------
 
 function KoWriter:eraseAt(x, y)
@@ -434,7 +463,7 @@ function KoWriter:eraseAt(x, y)
     table.insert(self.undo_stack, { type = "delete", strokes = removed })
     self:saveStrokes()
     -- Repaint the page cleanly so erased ink actually disappears from e-ink.
-    UIManager:setDirty(self.view, "ui")
+    self:renderNow(false)
 end
 
 -- --- View module: paint saved ink (and the toolbar) on every repaint --------
@@ -570,7 +599,7 @@ function KoWriter:runToolbarAction(action)
         self.ui:handleEvent(Event:new("GotoViewRel", 1))
     end
     self:computeToolbar()          -- labels may have changed
-    UIManager:setDirty(self.view, "ui")
+    self:requestRefresh(false)
 end
 
 -- --- Undo / clear ------------------------------------------------------------
@@ -589,7 +618,7 @@ function KoWriter:undo()
     end
     self:rebuildPageIndex()
     self:saveStrokes()
-    UIManager:setDirty(self.view, "ui")
+    self:requestRefresh(true)
 end
 
 function KoWriter:clearPage()
@@ -607,7 +636,7 @@ function KoWriter:clearPage()
     self:rebuildPageIndex()
     table.insert(self.undo_stack, { type = "delete", strokes = removed })
     self:saveStrokes()
-    UIManager:setDirty(self.view, "ui")
+    self:requestRefresh(true)
 end
 
 function KoWriter:clearAll()
@@ -615,7 +644,7 @@ function KoWriter:clearAll()
     self.page_strokes = {}
     self.undo_stack = {}
     self:saveStrokes()
-    UIManager:setDirty(self.view, "ui")
+    self:requestRefresh(true)
 end
 
 -- --- Page indexing -----------------------------------------------------------
