@@ -39,6 +39,9 @@ the page. Strokes are stored per page number in the document's sidecar directory
 
 ## Install
 
+> For a step‑by‑step walkthrough (adb and manual, plus updating/uninstalling),
+> see **[INSTALL.md](INSTALL.md)**. Short version below.
+
 1. Copy the `kowriter.koplugin` folder into KOReader's `plugins` directory.
 
    On an Onyx BOOX device, KOReader's home folder is usually
