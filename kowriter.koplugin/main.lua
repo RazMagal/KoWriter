@@ -111,12 +111,13 @@ function KoWriter:init()
     self.width_index = 2
     self.pen_only = false           -- ignore finger touches (needs tool-type patch)
     self.raw_coords = false         -- skip rotation transform (device tuning escape)
+    self.offset_x = 0               -- manual calibration nudge (logical px)
+    self.offset_y = 0
 
     self.strokes = {}               -- flat list of all strokes for this document
     self.page_strokes = {}          -- page -> { stroke indices }
     self.undo_stack = {}
-    self.contacts = {}              -- slot -> per-contact drawing state
-    self.current_stroke = nil
+    self.contacts = {}              -- slot -> per-contact drawing state (incl. its own in-progress stroke)
     self.strokes_loaded = false
 
     self.toolbar_buttons = nil      -- computed rects, valid while enabled
@@ -156,6 +157,8 @@ function KoWriter:loadSettings()
     self.width_index = s.width_index or self.width_index
     self.pen_only = s.pen_only or false
     self.raw_coords = s.raw_coords or false
+    self.offset_x = s.offset_x or 0
+    self.offset_y = s.offset_y or 0
 end
 
 function KoWriter:saveSettings()
@@ -164,6 +167,8 @@ function KoWriter:saveSettings()
         width_index = self.width_index,
         pen_only = self.pen_only,
         raw_coords = self.raw_coords,
+        offset_x = self.offset_x,
+        offset_y = self.offset_y,
     })
 end
 
@@ -181,8 +186,11 @@ function KoWriter:setEnabled(on)
         self:installInputHook()
         self:computeToolbar()
     else
-        self:removeInputHook()
+        -- Flush BEFORE removing the hook: removeInputHook() wipes self.contacts,
+        -- and each in-progress stroke now lives inside its contact, so flushing
+        -- first is what actually commits a stroke left unfinished at toggle-off.
         self:flushCurrentStroke()
+        self:removeInputHook()
         self.toolbar_buttons = nil
     end
     -- Full repaint so the toolbar and any in-flight ink settle cleanly.
@@ -238,8 +246,10 @@ end
 function KoWriter:handleSlots(slots)
     if not self.enabled or type(slots) ~= "table" then return false end
     -- A menu/dialog is up: don't capture, or the user couldn't dismiss it.
+    -- Commit any in-progress ink first so a stroke isn't lost if a popup
+    -- appears mid-line (flushCurrentStroke also releases the contacts).
     if self:isOverlayActive() then
-        self.contacts = {}
+        self:flushCurrentStroke()
         return false
     end
     local handled = false
@@ -263,16 +273,35 @@ function KoWriter:handleSlots(slots)
 end
 
 -- Map a raw slot coordinate to logical screen coordinates.
+--
+-- KOReader itself receives these same raw (device scale/mirror/translate already
+-- applied) coordinates in gesture_detector:feedEvent and only rotates them
+-- *afterwards*, in GestureDetector:translateCoordinates, using the screen's
+-- getTouchRotation() -- NOT getRotationMode(). The two are equal on most panels
+-- but a device may override getTouchRotation() when the digitizer axes are
+-- desynced from the display (forced/native rotation), so we mirror KOReader's
+-- exact choice to keep ink under the pen in every orientation. The formulas in
+-- transformForRotation are the same ones translateCoordinates uses.
 function KoWriter:mapCoords(x, y)
     if x == nil or y == nil then return nil end
-    if self.raw_coords then return x, y end
+    if self.raw_coords then
+        return x + self.offset_x, y + self.offset_y
+    end
     local w, h = Screen:getWidth(), Screen:getHeight()
-    local rot = Screen:getRotationMode()
+    local rot = Screen.getTouchRotation and Screen:getTouchRotation()
+        or Screen:getRotationMode()
     local lx, ly = transformForRotation(x, y, rot, w, h)
-    return lx, ly
+    return lx + self.offset_x, ly + self.offset_y
 end
 
 -- New point on a contact (down or move share this path; we key by slot).
+--
+-- Each contact owns its own in-progress stroke (c.stroke). This is deliberate:
+-- with a single shared stroke, a second contact landing mid-line -- a resting
+-- palm, or a phantom touch from a flaky/cracked digitizer -- would hijack the
+-- pen's stroke and make the ink jump between the pen and the spurious point.
+-- Isolating strokes per contact means a stray touch draws its own (ignorable)
+-- mark instead of corrupting what you're actually writing.
 function KoWriter:onContactDown(slot, x, y, tool)
     local c = self.contacts[slot]
     if not c then
@@ -289,14 +318,28 @@ function KoWriter:onContactDown(slot, x, y, tool)
             self.contacts[slot] = { mode = "ignore" }
             return
         end
-        -- 3) drawing.
-        self.contacts[slot] = { mode = "draw", last_x = x, last_y = y }
-        self:strokeStart(x, y)
+        -- 3) eraser: no stroke, just remove ink under each sample.
+        if self.current_tool == TOOL_ERASER then
+            self.contacts[slot] = { mode = "erase", last_x = x, last_y = y }
+            self:eraseAt(x, y)
+            return
+        end
+        -- 4) pen: start this contact's own stroke.
+        c = { mode = "draw", last_x = x, last_y = y, stroke = self:newStroke(x, y) }
+        self.contacts[slot] = c
+        -- Draw the initial dot immediately for responsiveness.
+        self:paintDot(Screen.bb, x, y, c.stroke.width, self:strokeColor(c.stroke))
+        self:refreshRegion(x, y, x, y, c.stroke.width)
         return
     end
     if c.mode == "draw" then
         if x ~= c.last_x or y ~= c.last_y then
-            self:strokeAppend(c.last_x, c.last_y, x, y)
+            self:appendToStroke(c.stroke, c.last_x, c.last_y, x, y)
+            c.last_x, c.last_y = x, y
+        end
+    elseif c.mode == "erase" then
+        if x ~= c.last_x or y ~= c.last_y then
+            self:eraseAt(x, y)
             c.last_x, c.last_y = x, y
         end
     end
@@ -306,20 +349,24 @@ end
 function KoWriter:onContactUp(slot)
     local c = self.contacts[slot]
     if c and c.mode == "draw" then
-        self:strokeEnd()
+        self:finishStroke(c.stroke)
     end
     self.contacts[slot] = nil
 end
 
 -- --- Stroke building & incremental drawing ----------------------------------
 
-function KoWriter:strokeStart(x, y)
-    if self.current_tool == TOOL_ERASER then
-        self.current_stroke = nil
-        self:eraseAt(x, y)
-        return
+-- Resolve a stroke's stored color name to a Blitbuffer color (falls back to
+-- black so a stroke saved with an old/unknown color still renders).
+function KoWriter:strokeColor(stroke)
+    for _, c in ipairs(COLORS) do
+        if c.name == stroke.color_name then return c.color end
     end
-    self.current_stroke = {
+    return Blitbuffer.COLOR_BLACK
+end
+
+function KoWriter:newStroke(x, y)
+    return {
         page = self:getCurrentPage(),
         tool = TOOL_PEN,
         width = WIDTHS[self.width_index],
@@ -327,41 +374,33 @@ function KoWriter:strokeStart(x, y)
         points = { { x = x, y = y } },
         datetime = os.time(),
     }
-    -- Draw the initial dot immediately for responsiveness.
-    self:paintDot(Screen.bb, x, y, self.current_stroke.width,
-        COLORS[self.color_index].color)
-    self:refreshRegion(x, y, x, y, self.current_stroke.width)
 end
 
-function KoWriter:strokeAppend(x0, y0, x1, y1)
-    if self.current_tool == TOOL_ERASER then
-        self:eraseAt(x1, y1)
-        return
-    end
-    if not self.current_stroke then return end
-    table.insert(self.current_stroke.points, { x = x1, y = y1 })
-    local w = self.current_stroke.width
-    local color = COLORS[self.color_index].color
-    self:paintSegment(Screen.bb, x0, y0, x1, y1, w, color)
-    self:refreshRegion(x0, y0, x1, y1, w)
+function KoWriter:appendToStroke(stroke, x0, y0, x1, y1)
+    if not stroke then return end
+    table.insert(stroke.points, { x = x1, y = y1 })
+    local color = self:strokeColor(stroke)
+    self:paintSegment(Screen.bb, x0, y0, x1, y1, stroke.width, color)
+    self:refreshRegion(x0, y0, x1, y1, stroke.width)
 end
 
-function KoWriter:strokeEnd()
-    local s = self.current_stroke
-    self.current_stroke = nil
-    if not s or #s.points < 1 then return end
-    table.insert(self.strokes, s)
-    self:indexStroke(#self.strokes, s.page)
-    table.insert(self.undo_stack, { type = "add", idx = #self.strokes })
+function KoWriter:finishStroke(stroke)
+    if not stroke or #stroke.points < 1 then return end
+    table.insert(self.strokes, stroke)
+    self:indexStroke(#self.strokes, stroke.page)
+    -- Store the stroke object itself, not its list index: erase/clear rebuild
+    -- the flat list and shift indices, which would make an index-based undo
+    -- delete the wrong stroke.
+    table.insert(self.undo_stack, { type = "add", stroke = stroke })
     self:saveStrokes()
 end
 
--- Persist an in-progress stroke (used on page change / disable / close).
+-- Persist every in-progress stroke (used on page change / disable / close).
 function KoWriter:flushCurrentStroke()
-    if self.current_stroke and #self.current_stroke.points >= 1 then
-        self:strokeEnd()
-    else
-        self.current_stroke = nil
+    for _, c in pairs(self.contacts) do
+        if c.mode == "draw" and c.stroke then
+            self:finishStroke(c.stroke)
+        end
     end
     self.contacts = {}
 end
@@ -476,8 +515,11 @@ function KoWriter:paintTo(bb, x, y)
             self:renderStroke(bb, self.strokes[idx])
         end
     end
-    if self.current_stroke and self.current_stroke.page == page then
-        self:renderStroke(bb, self.current_stroke)
+    -- In-progress strokes: one per active drawing contact (usually just one).
+    for _, c in pairs(self.contacts) do
+        if c.stroke and c.stroke.page == page then
+            self:renderStroke(bb, c.stroke)
+        end
     end
     if self.enabled then
         self:paintToolbar(bb)
@@ -486,10 +528,7 @@ end
 
 function KoWriter:renderStroke(bb, s)
     if not s or not s.points or #s.points < 1 then return end
-    local color = Blitbuffer.COLOR_BLACK
-    for _, c in ipairs(COLORS) do
-        if c.name == s.color_name then color = c.color break end
-    end
+    local color = self:strokeColor(s)
     local w = s.width or 4
     if #s.points == 1 then
         self:paintDot(bb, s.points[1].x, s.points[1].y, w, color)
@@ -608,8 +647,12 @@ function KoWriter:undo()
     local a = table.remove(self.undo_stack)
     if not a then return end
     if a.type == "add" then
-        if self.strokes[a.idx] then
-            table.remove(self.strokes, a.idx)
+        -- Remove by identity (indices shift when other strokes are erased).
+        for i, s in ipairs(self.strokes) do
+            if s == a.stroke then
+                table.remove(self.strokes, i)
+                break
+            end
         end
     elseif a.type == "delete" then
         for _, s in ipairs(a.strokes) do
@@ -763,6 +806,61 @@ end
 
 -- --- Menu --------------------------------------------------------------------
 
+-- One axis of the calibration submenu: a spinner that nudges ink position.
+function KoWriter:offsetSpinItem(label, info, getter, setter)
+    return {
+        keep_menu_open = true,
+        text_func = function() return T("%1: %2 px", label, getter()) end,
+        callback = function(touchmenu_instance)
+            local SpinWidget = require("ui/widget/spinwidget")
+            UIManager:show(SpinWidget:new{
+                title_text = label,
+                info_text = info,
+                value = getter(),
+                value_min = -300,
+                value_max = 300,
+                value_step = 1,
+                value_hold_step = 10,
+                ok_text = _("Set"),
+                callback = function(spin)
+                    setter(spin.value)
+                    self:saveSettings()
+                    -- Repaint so the new mapping takes effect for the next stroke
+                    -- and the label updates.
+                    if self.enabled then self:requestRefresh(false) end
+                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                end,
+            })
+        end,
+    }
+end
+
+function KoWriter:calibrationMenu()
+    return {
+        self:offsetSpinItem(_("Horizontal offset"),
+            _("Positive moves ink to the right, negative to the left."),
+            function() return self.offset_x end,
+            function(v) self.offset_x = v end),
+        self:offsetSpinItem(_("Vertical offset"),
+            _("Positive moves ink down, negative up."),
+            function() return self.offset_y end,
+            function(v) self.offset_y = v end),
+        {
+            text = _("Reset to no offset"),
+            keep_menu_open = true,
+            enabled_func = function()
+                return self.offset_x ~= 0 or self.offset_y ~= 0
+            end,
+            callback = function(touchmenu_instance)
+                self.offset_x, self.offset_y = 0, 0
+                self:saveSettings()
+                if self.enabled then self:requestRefresh(false) end
+                if touchmenu_instance then touchmenu_instance:updateItems() end
+            end,
+        },
+    }
+end
+
 function KoWriter:addToMainMenu(menu_items)
     menu_items.kowriter = {
         text = _("KoWriter"),
@@ -813,6 +911,14 @@ function KoWriter:addToMainMenu(menu_items)
                     self.raw_coords = not self.raw_coords
                     self:saveSettings()
                 end,
+            },
+            {
+                text_func = function()
+                    return T(_("Calibrate ink position (X %1, Y %2)"),
+                        self.offset_x, self.offset_y)
+                end,
+                help_text = _("If ink lands a little off from the pen tip -- the way it doesn't in the built-in notes app, which calibrates the pen -- nudge it here. The offset is in screen pixels for your current reading orientation (+X right, +Y down). Set it, then draw to check."),
+                sub_item_table = self:calibrationMenu(),
                 separator = true,
             },
             {
@@ -862,18 +968,21 @@ Tool: %2
 Color: %3   Width: %4
 Pen only: %5
 Input hook active: %6
+Ink offset: X %7, Y %8
 
-Current page: %7
-Ink on this page: %8
-Total strokes in book: %9
+Current page: %9
+Ink on this page: %10
+Total strokes in book: %11
 
-Storage: %10]]),
+Storage: %12]]),
             self.enabled and _("ON") or _("off"),
             self.current_tool,
             COLORS[self.color_index].name,
             WIDTHS[self.width_index],
             self.pen_only and _("yes") or _("no"),
             hooked and _("yes") or _("no"),
+            self.offset_x,
+            self.offset_y,
             tostring(page),
             on_page,
             #self.strokes,

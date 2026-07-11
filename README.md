@@ -9,11 +9,10 @@ KOReader has **no native stylus support on Android** (Onyx BOOX, Bigme, etc.).
 The only ink‑on‑document plugin that exists, `pencil.koplugin`, is Kobo‑only. This
 plugin fills that gap for Android e‑readers.
 
-> **Status: v1, works but unproven on hardware.** It was built against the real
-> KOReader APIs and passes syntax/API checks, but it has **not** yet been run on
-> a device. Treat the first session as a shakedown. It is designed to be safe:
-> nothing is hooked until you turn *Write mode* on, so if something misbehaves,
-> just leave write mode and reading is completely unaffected.
+> **Status: v1, working on hardware** (tested on an Onyx BOOX Note3). It is
+> designed to be safe: nothing is hooked until you turn *Write mode* on, so if
+> something misbehaves, just leave write mode and reading is completely
+> unaffected.
 
 ---
 
@@ -82,12 +81,19 @@ the page. Strokes are stored per page number in the document's sidecar directory
 
 ## Tuning & troubleshooting
 
-**Ink lands in the wrong place / mirrored / rotated.** This is the single most
-likely thing to need adjustment, because it depends on how your specific panel
-reports touch coordinates. Open **KoWriter → Raw coordinates (no rotation fix)**
-and toggle it. One of the two settings will be correct for your device and
-orientation. (KoWriter reads mostly in one orientation; pick the setting that's
-right for how you hold the device.)
+**Ink lands a little off from the pen tip.** The built-in notes app calibrates
+the pen to the panel; KOReader can't, so on some devices ink sits a few pixels
+away from where you touch. Open **KoWriter → Calibrate ink position** and nudge
+the horizontal/vertical offset until ink lands under the pen. The offset is in
+screen pixels for your current reading orientation (+X right, +Y down) and is
+remembered. Set it, then draw to check.
+
+**Ink is badly mirrored or rotated (not just a small offset).** This depends on
+how your specific panel reports touch coordinates. KoWriter now rotates touch
+input exactly the way KOReader's own gesture engine does (via the screen's
+touch-rotation), so this should be right out of the box — but if it isn't, open
+**KoWriter → Raw coordinates (no rotation fix)** and toggle it; one of the two
+settings will be correct for your device and orientation.
 
 **My palm draws too.** On stock Android, KOReader can't tell the pen from a
 finger, so both draw. Two options:
@@ -126,8 +132,9 @@ or read `koreader/crash.log`. The lines `KoWriter: input hook installed` and
 
 ## Limitations (v1, honest list)
 
-- **No on‑device testing yet** — expect to tune the coordinate setting first.
-- **No palm rejection** without the optional patch.
+- **No palm rejection** without the optional patch (each touch draws its own
+  stroke, so a stray palm/phantom touch makes its own mark but won't corrupt the
+  line you're writing).
 - **No pressure / tilt** (stock Android drops it before KOReader sees it).
 - **Ink is screen‑space per page**, so font/zoom/rotation changes can misalign
   existing EPUB ink.
