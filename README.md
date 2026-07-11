@@ -96,11 +96,13 @@ touch-rotation), so this should be right out of the box — but if it isn't, ope
 settings will be correct for your device and orientation.
 
 **My palm draws too.** On stock Android, KOReader can't tell the pen from a
-finger, so both draw. Two options:
+finger, so both draw (there is no reliable way to separate them, so KoWriter
+doesn't pretend to — each touch just draws its own stroke). Two options:
 
 - Rest your palm off the screen while writing (simplest), or
-- Apply the optional tool‑type patch (see `patches/`) and then enable
-  **KoWriter → Pen only (ignore finger)**. That gives true palm rejection.
+- Apply the optional tool‑type patch (see `patches/`). Once the device reports
+  tool types, KoWriter **automatically** ignores finger/palm touches and only the
+  pen draws — no setting to flip.
 
 **Nothing draws / it turns pages instead.** Make sure *Write mode* is **on**
 (check **KoWriter → About / status** — it shows "Write mode: ON" and "Input hook

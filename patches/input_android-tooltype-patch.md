@@ -1,8 +1,10 @@
 # Optional patch: expose stylus tool‑type on Android (real palm rejection)
 
 **You do not need this to use KoWriter.** Without it, pen and finger both draw.
-Apply it only if you want true palm rejection — after which you can enable
-**KoWriter → Pen only (ignore finger)** and rest your hand on the screen freely.
+Apply it only if you want true palm rejection — after which KoWriter
+**automatically** ignores finger/palm touches (it can finally tell them apart),
+so only the pen draws and you can rest your hand on the screen freely. There is
+no setting to flip; it just works once the tool type is available.
 
 This is the same change that would let *any* KOReader stylus plugin work on
 Android, and it's the fix that belongs upstream (see koreader/koreader
@@ -79,15 +81,16 @@ KOReader's `Input` class already reads `ABS_MT_TOOL_TYPE` into each touch slot's
 `.tool` field (`0` finger, `1` pen, `2` eraser). After this patch, KoWriter's
 input hook sees `slot.tool` populated, so:
 
-- **KoWriter → Pen only (ignore finger)** actually ignores finger/palm touches.
+- KoWriter automatically ignores any touch the device reports as a finger, so
+  your palm no longer draws — only the pen does. No setting required.
 - A future KoWriter version can auto‑switch to the eraser when you flip a
   stylus that reports the eraser end.
 
 ## Verifying
 
 With **Input debug** in KOReader's dev settings, or by watching `adb logcat`,
-confirm touches now carry a tool type. In KoWriter, enable *Pen only*, then draw
-with a finger (should do nothing) and the stylus (should draw).
+confirm touches now carry a tool type. In KoWriter write mode, draw with a finger
+(should do nothing) and the stylus (should draw).
 
 ## Note on risk
 

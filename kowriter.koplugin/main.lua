@@ -51,10 +51,11 @@ end
 local TOOL_PEN = "pen"
 local TOOL_ERASER = "eraser"
 
--- Linux ABS_MT_TOOL_TYPE values, mirrored by the optional input_android patch.
--- On stock Android these are always nil (finger), so both pen and finger draw.
+-- Linux ABS_MT_TOOL_TYPE value for a finger, as exposed by the optional
+-- input_android tool-type patch. On stock Android the tool type is never
+-- reported (tool == nil), so pen and finger are indistinguishable and both
+-- draw; only a patched device reports this, letting us drop finger/palm touches.
 local MT_TOOL_FINGER = 0
-local MT_TOOL_PEN = 1
 
 -- Palette. Kept small; on a grayscale panel the non-black entries render as
 -- gray, which is still useful for distinguishing layers of notes.
@@ -109,7 +110,6 @@ function KoWriter:init()
     self.current_tool = TOOL_PEN
     self.color_index = 1
     self.width_index = 2
-    self.pen_only = false           -- ignore finger touches (needs tool-type patch)
     self.raw_coords = false         -- skip rotation transform (device tuning escape)
     self.offset_x = 0               -- manual calibration nudge (logical px)
     self.offset_y = 0
@@ -155,7 +155,6 @@ function KoWriter:loadSettings()
     local s = G_reader_settings:readSetting("kowriter_settings") or {}
     self.color_index = s.color_index or self.color_index
     self.width_index = s.width_index or self.width_index
-    self.pen_only = s.pen_only or false
     self.raw_coords = s.raw_coords or false
     self.offset_x = s.offset_x or 0
     self.offset_y = s.offset_y or 0
@@ -165,7 +164,6 @@ function KoWriter:saveSettings()
     G_reader_settings:saveSetting("kowriter_settings", {
         color_index = self.color_index,
         width_index = self.width_index,
-        pen_only = self.pen_only,
         raw_coords = self.raw_coords,
         offset_x = self.offset_x,
         offset_y = self.offset_y,
@@ -313,8 +311,12 @@ function KoWriter:onContactDown(slot, x, y, tool)
             self:runToolbarAction(action)
             return
         end
-        -- 2) finger, with pen-only enabled and tool info available? ignore.
-        if self.pen_only and tool ~= nil and tool ~= MT_TOOL_PEN then
+        -- 2) a touch the device explicitly reports as a finger? drop it (palm
+        -- rejection). This only fires when tool-type is available, i.e. on a
+        -- device with the optional input_android patch; on stock Android tool is
+        -- nil, so fingers draw just like the pen (there's no way to tell them
+        -- apart). No user setting -- it's automatic when the data exists.
+        if tool == MT_TOOL_FINGER then
             self.contacts[slot] = { mode = "ignore" }
             return
         end
@@ -868,7 +870,7 @@ function KoWriter:addToMainMenu(menu_items)
         sub_item_table = {
             {
                 text = _("Write mode"),
-                help_text = _("When on, the pen/finger draws on the page and normal reading gestures are suspended. Use the on-page toolbar's Done button (or this toggle) to leave."),
+                help_text = _("When on, the pen/finger draws on the page and normal reading gestures are suspended. Use the on-page toolbar's Done button (or this toggle) to leave.\n\nTip: for one-tap access, map \"KoWriter: toggle write mode\" to a gesture or a hardware key under Settings (gear) -> Taps and gestures -> Gesture manager."),
                 checked_func = function() return self.enabled end,
                 callback = function() self:setEnabled(not self.enabled) end,
                 separator = true,
@@ -893,15 +895,6 @@ function KoWriter:addToMainMenu(menu_items)
                     if self.enabled then self:computeToolbar() end
                 end,
                 separator = true,
-            },
-            {
-                text = _("Pen only (ignore finger)"),
-                help_text = _("Ignore finger touches so your palm does not draw. Requires the optional input_android tool-type patch (see README); without it, finger and pen are indistinguishable and this has no effect."),
-                checked_func = function() return self.pen_only end,
-                callback = function()
-                    self.pen_only = not self.pen_only
-                    self:saveSettings()
-                end,
             },
             {
                 text = _("Raw coordinates (no rotation fix)"),
@@ -966,20 +959,18 @@ function KoWriter:showStatus()
 Write mode: %1
 Tool: %2
 Color: %3   Width: %4
-Pen only: %5
-Input hook active: %6
-Ink offset: X %7, Y %8
+Input hook active: %5
+Ink offset: X %6, Y %7
 
-Current page: %9
-Ink on this page: %10
-Total strokes in book: %11
+Current page: %8
+Ink on this page: %9
+Total strokes in book: %10
 
-Storage: %12]]),
+Storage: %11]]),
             self.enabled and _("ON") or _("off"),
             self.current_tool,
             COLORS[self.color_index].name,
             WIDTHS[self.width_index],
-            self.pen_only and _("yes") or _("no"),
             hooked and _("yes") or _("no"),
             self.offset_x,
             self.offset_y,
