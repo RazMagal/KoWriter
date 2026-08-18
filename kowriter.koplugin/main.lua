@@ -36,6 +36,7 @@ local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
+local util = require("util")
 local dump = require("dump")
 local _ = require("gettext")
 local T = require("ffi/util").template
@@ -67,6 +68,14 @@ local COLORS = {
 }
 
 local WIDTHS = { 2, 4, 6, 9 }
+
+-- Stroke file format version; bump when the on-disk shape changes. A file with
+-- a NEWER version than this is left untouched (never overwritten) so a
+-- downgraded build can't wipe ink written by a newer one.
+local STROKES_FORMAT_VERSION = 1
+
+-- Cap the undo history so deleted stroke tables don't accumulate all session.
+local UNDO_LIMIT = 100
 
 -- ---------------------------------------------------------------------------
 -- Small geometry helpers (inlined so the plugin is a single self-contained
@@ -119,6 +128,14 @@ function KoWriter:init()
     self.undo_stack = {}
     self.contacts = {}              -- slot -> per-contact drawing state (incl. its own in-progress stroke)
     self.strokes_loaded = false
+    self.load_failed = false        -- strokes file unreadable: refuse to overwrite it
+    self._pending_unhook = false    -- write mode off, waiting for contacts to lift
+    self._save_scheduled = false
+    self._save_warned = false
+    self._scroll_warned = false
+    self._reader_ready = false
+    self._pending_msg = nil
+    self._migrate_from = nil        -- legacy sidecar to set aside after next save
 
     self.toolbar_buttons = nil      -- computed rects, valid while enabled
 
@@ -155,6 +172,10 @@ function KoWriter:loadSettings()
     local s = G_reader_settings:readSetting("kowriter_settings") or {}
     self.color_index = s.color_index or self.color_index
     self.width_index = s.width_index or self.width_index
+    -- Settings can come from a build with a different palette; clamp so an
+    -- out-of-range index can't crash COLORS[...]/WIDTHS[...] lookups.
+    if not COLORS[self.color_index] then self.color_index = 1 end
+    if not WIDTHS[self.width_index] then self.width_index = 2 end
     self.raw_coords = s.raw_coords or false
     self.offset_x = s.offset_x or 0
     self.offset_y = s.offset_y or 0
@@ -181,14 +202,40 @@ function KoWriter:setEnabled(on)
     if on == self.enabled then return end
     self.enabled = on
     if on then
+        self._pending_unhook = false
+        -- A watchdog queued by an earlier disable must not fire into this
+        -- new enable cycle and yank the hook out from under the pen.
+        if self._unhook_watchdog then
+            UIManager:unschedule(self._unhook_watchdog)
+        end
         self:installInputHook()
         self:computeToolbar()
     else
-        -- Flush BEFORE removing the hook: removeInputHook() wipes self.contacts,
-        -- and each in-progress stroke now lives inside its contact, so flushing
-        -- first is what actually commits a stroke left unfinished at toggle-off.
+        -- Flush BEFORE removing the hook, so a stroke left unfinished at
+        -- toggle-off is committed.
         self:flushCurrentStroke()
-        self:removeInputHook()
+        self:saveStrokes()
+        -- If a contact is still physically down (the pen that just tapped
+        -- "Done"), removing the hook now would hand its lift to KOReader as a
+        -- fresh tap in the menu/page-turn zone. Keep swallowing frames until
+        -- every contact lifts; onContactUp() removes the hook then.
+        if next(self.contacts) then
+            self._pending_unhook = true
+            -- Escape hatch: if the lift is never delivered (phantom contact,
+            -- suspend mid-tap), don't leave the hook eating all input forever.
+            -- Accepted residual: holding the pen down > 3 s after tapping Done
+            -- also fires this and hands the eventual lift to KOReader.
+            self._unhook_watchdog = self._unhook_watchdog or function()
+                if self._pending_unhook then
+                    logger.warn("KoWriter: unhook watchdog fired (missed contact lift)")
+                    self:removeInputHook()
+                end
+            end
+            UIManager:unschedule(self._unhook_watchdog)
+            UIManager:scheduleIn(3, self._unhook_watchdog)
+        else
+            self:removeInputHook()
+        end
         self.toolbar_buttons = nil
     end
     -- Full repaint so the toolbar and any in-flight ink settle cleanly.
@@ -208,22 +255,35 @@ function KoWriter:installInputHook()
     self._orig_feedEvent = gd.feedEvent
     local plugin = self
     local orig = self._orig_feedEvent
-    gd.feedEvent = function(gdself, slots)
+    self._hook_fn = function(gdself, slots)
         local swallow = plugin:handleSlots(slots)
         if swallow then
             return {}   -- no gestures -> reader ignores this frame
         end
         return orig(gdself, slots)
     end
+    gd.feedEvent = self._hook_fn
     logger.info("KoWriter: input hook installed")
 end
 
 function KoWriter:removeInputHook()
     local gd = Device.input and Device.input.gesture_detector
     if gd and self._orig_feedEvent then
-        gd.feedEvent = self._orig_feedEvent
+        -- Only restore if our wrapper is still the active hook. If another
+        -- plugin wrapped feedEvent after us, blindly restoring our saved
+        -- original would silently discard that plugin's wrapper.
+        if gd.feedEvent == self._hook_fn then
+            gd.feedEvent = self._orig_feedEvent
+        else
+            logger.warn("KoWriter: feedEvent was re-wrapped after us; leaving it in place")
+        end
     end
     self._orig_feedEvent = nil
+    self._hook_fn = nil
+    self._pending_unhook = false
+    if self._unhook_watchdog then
+        UIManager:unschedule(self._unhook_watchdog)
+    end
     self.contacts = {}
     -- Reset the detector so a half-seen contact does not confuse it later.
     if Device.input and Device.input.resetState then
@@ -232,8 +292,23 @@ function KoWriter:removeInputHook()
     logger.info("KoWriter: input hook removed")
 end
 
+-- True while our wrapper really is the live feedEvent (not merely "we
+-- installed at some point") — this is what About/status reports.
+function KoWriter:isHookActive()
+    local gd = Device.input and Device.input.gesture_detector
+    return gd ~= nil and self._hook_fn ~= nil and gd.feedEvent == self._hook_fn
+end
+
 -- True when something (a menu, dialog, popup) is shown on top of the reader.
 -- While that's the case we must let input through so those widgets work.
+--
+-- Deliberately coarse: ANY topmost widget that isn't ReaderUI releases the
+-- pen. Trying to carve out "harmless" anonymous widgets (transient toasts)
+-- was tested and is unsafe — KOReader's TouchMenu container is itself
+-- anonymous (no name/id/modal/covers_fullscreen), so the carve-out swallowed
+-- the user's menu taps and drew dots instead (verified on hardware). The cost
+-- is only that a stray toast mid-stroke flushes the stroke and lets input
+-- through until it times out — rare and recoverable.
 function KoWriter:isOverlayActive()
     local top = UIManager:getTopmostVisibleWidget()
     if not top then return false end
@@ -242,12 +317,23 @@ end
 
 -- Returns true to swallow the frame (we handled it), false to pass through.
 function KoWriter:handleSlots(slots)
-    if not self.enabled or type(slots) ~= "table" then return false end
+    if not (self.enabled or self._pending_unhook) or type(slots) ~= "table" then
+        return false
+    end
     -- A menu/dialog is up: don't capture, or the user couldn't dismiss it.
     -- Commit any in-progress ink first so a stroke isn't lost if a popup
-    -- appears mid-line (flushCurrentStroke also releases the contacts).
-    if self:isOverlayActive() then
+    -- appears mid-line.
+    if self.enabled and self:isOverlayActive() then
         self:flushCurrentStroke()
+        -- We're passing this frame through, so onContactUp will not see any
+        -- lift it contains. Drop lifted slots here, or the stale entry would
+        -- make the slot's next (fresh) contact look like a continuation and
+        -- silently swallow a whole stroke.
+        for _, ev in ipairs(slots) do
+            if ev and ev.slot ~= nil and (ev.id == nil or ev.id == -1) then
+                self.contacts[ev.slot] = nil
+            end
+        end
         return false
     end
     local handled = false
@@ -256,7 +342,16 @@ function KoWriter:handleSlots(slots)
             local down = (ev.id ~= nil and ev.id ~= -1)
             local x, y = self:mapCoords(ev.x, ev.y)
             if down and x then
-                self:onContactDown(ev.slot, x, y, ev.tool)
+                if self._pending_unhook then
+                    -- Write mode is already off; we're only riding out the
+                    -- contacts that were down when it was turned off. Swallow
+                    -- their frames (and any newcomer's) without drawing.
+                    if not self.contacts[ev.slot] then
+                        self.contacts[ev.slot] = { mode = "ignore" }
+                    end
+                else
+                    self:onContactDown(ev.slot, x, y, ev.tool)
+                end
                 handled = true
             elseif down then
                 -- coordinate off-screen / unusable; keep the frame ours anyway
@@ -322,8 +417,9 @@ function KoWriter:onContactDown(slot, x, y, tool)
         end
         -- 3) eraser: no stroke, just remove ink under each sample.
         if self.current_tool == TOOL_ERASER then
-            self.contacts[slot] = { mode = "erase", last_x = x, last_y = y }
-            self:eraseAt(x, y)
+            c = { mode = "erase", last_x = x, last_y = y }
+            self.contacts[slot] = c
+            self:eraseAt(x, y, c)
             return
         end
         -- 4) pen: start this contact's own stroke.
@@ -341,7 +437,7 @@ function KoWriter:onContactDown(slot, x, y, tool)
         end
     elseif c.mode == "erase" then
         if x ~= c.last_x or y ~= c.last_y then
-            self:eraseAt(x, y)
+            self:eraseAt(x, y, c)
             c.last_x, c.last_y = x, y
         end
     end
@@ -350,10 +446,20 @@ end
 
 function KoWriter:onContactUp(slot)
     local c = self.contacts[slot]
-    if c and c.mode == "draw" then
+    if c and c.mode == "draw" and c.stroke then
         self:finishStroke(c.stroke)
+    elseif c and c.mode == "erase" and c.erased then
+        -- Batched eraser commit: one save and one clean (flashing) repaint per
+        -- eraser drag, instead of a full save + full repaint per sample.
+        self:saveStrokes()
+        self:renderNow(true)
     end
     self.contacts[slot] = nil
+    -- Write mode was turned off while this contact was down; once the last
+    -- contact lifts, it is finally safe to hand input back to KOReader.
+    if self._pending_unhook and not next(self.contacts) then
+        self:removeInputHook()
+    end
 end
 
 -- --- Stroke building & incremental drawing ----------------------------------
@@ -393,18 +499,56 @@ function KoWriter:finishStroke(stroke)
     -- Store the stroke object itself, not its list index: erase/clear rebuild
     -- the flat list and shift indices, which would make an index-based undo
     -- delete the wrong stroke.
-    table.insert(self.undo_stack, { type = "add", stroke = stroke })
-    self:saveStrokes()
+    self:pushUndo({ type = "add", stroke = stroke })
+    self:scheduleSave()
+end
+
+function KoWriter:pushUndo(action)
+    table.insert(self.undo_stack, action)
+    if #self.undo_stack > UNDO_LIMIT then
+        table.remove(self.undo_stack, 1)
+    end
+end
+
+-- Debounced persistence. saveStrokes() rewrites the whole stroke file, so
+-- saving synchronously on every stroke end (and worse, every eraser sample)
+-- scales with the ink in the book, not the edit. Leading-edge debounce: the
+-- first dirty change schedules a save 2 s out, so exposure is bounded at 2 s
+-- even while stroking continuously (a hard app kill inside that window loses
+-- at most those 2 s of ink — the deliberate trade). Disable, close, suspend,
+-- eraser lift and undo/clear still call saveStrokes() directly, which cancels
+-- the pending timer; page turns only flush strokes and ride the debounce.
+function KoWriter:scheduleSave()
+    if self._save_scheduled then return end
+    self._save_scheduled = true
+    self._save_cb = self._save_cb or function()
+        self._save_scheduled = false
+        self:saveStrokes()
+    end
+    UIManager:scheduleIn(2, self._save_cb)
 end
 
 -- Persist every in-progress stroke (used on page change / disable / close).
+--
+-- Deliberately does NOT delete the slot entries: the contacts may still be
+-- physically down, and deleting them would make their next input sample look
+-- like a fresh contact — re-firing the toolbar action under a held finger
+-- (page turns repeating) or starting a phantom stroke. The entries are
+-- switched to "ignore" and removed in onContactUp()/removeInputHook().
 function KoWriter:flushCurrentStroke()
     for _, c in pairs(self.contacts) do
         if c.mode == "draw" and c.stroke then
             self:finishStroke(c.stroke)
+            c.stroke = nil
+            c.mode = "ignore"
+        elseif c.mode == "erase" then
+            if c.erased then
+                self:saveStrokes()
+                c.erased = nil
+            end
+            c.mode = "ignore"
         end
     end
-    self.contacts = {}
 end
 
 -- --- Low-level painting ------------------------------------------------------
@@ -479,7 +623,7 @@ end
 
 -- --- Eraser ------------------------------------------------------------------
 
-function KoWriter:eraseAt(x, y)
+function KoWriter:eraseAt(x, y, contact)
     local page = self:getCurrentPage()
     local indices = self.page_strokes[page]
     if not indices then return end
@@ -501,10 +645,43 @@ function KoWriter:eraseAt(x, y)
     end
     self.strokes = keep
     self:rebuildPageIndex()
-    table.insert(self.undo_stack, { type = "delete", strokes = removed })
-    self:saveStrokes()
-    -- Repaint the page cleanly so erased ink actually disappears from e-ink.
-    self:renderNow(false)
+    if contact then
+        -- One undo entry per eraser drag, not per sample: a single drag that
+        -- removes five strokes should be one Undo press, not five.
+        if contact.undo_entry then
+            for _, s in ipairs(removed) do
+                table.insert(contact.undo_entry.strokes, s)
+            end
+        else
+            contact.undo_entry = { type = "delete", strokes = removed }
+            self:pushUndo(contact.undo_entry)
+        end
+        contact.erased = true
+        -- Live feedback. Note: paintTo below is a FULL document repaint into
+        -- the framebuffer; only the e-ink refresh is bounded to the bbox. It
+        -- runs once per sample that actually removed a stroke, so cost is
+        -- bounded by strokes erased, not drag length. The save and a clean
+        -- flashing repaint still happen once, on lift.
+        local x1, y1 = math.huge, math.huge
+        local x2, y2, w = -math.huge, -math.huge, 0
+        for _, s in ipairs(removed) do
+            if (s.width or 4) > w then w = s.width or 4 end
+            for _, p in ipairs(s.points) do
+                if p.x < x1 then x1 = p.x end
+                if p.y < y1 then y1 = p.y end
+                if p.x > x2 then x2 = p.x end
+                if p.y > y2 then y2 = p.y end
+            end
+        end
+        if x1 <= x2 and self.ui.view then
+            self.ui.view:paintTo(Screen.bb, 0, 0)
+            self:refreshRegion(x1, y1, x2, y2, w)
+        end
+    else
+        self:pushUndo({ type = "delete", strokes = removed })
+        self:saveStrokes()
+        self:renderNow(true)
+    end
 end
 
 -- --- View module: paint saved ink (and the toolbar) on every repaint --------
@@ -648,7 +825,9 @@ end
 function KoWriter:undo()
     local a = table.remove(self.undo_stack)
     if not a then return end
+    local page
     if a.type == "add" then
+        page = a.stroke.page
         -- Remove by identity (indices shift when other strokes are erased).
         for i, s in ipairs(self.strokes) do
             if s == a.stroke then
@@ -657,6 +836,7 @@ function KoWriter:undo()
             end
         end
     elseif a.type == "delete" then
+        page = a.strokes[1] and a.strokes[1].page
         for _, s in ipairs(a.strokes) do
             table.insert(self.strokes, s)
         end
@@ -664,6 +844,16 @@ function KoWriter:undo()
     self:rebuildPageIndex()
     self:saveStrokes()
     self:requestRefresh(true)
+    -- Undo history spans the whole book; when it touched another page, say so
+    -- instead of looking like a no-op. Menu-driven undo only: in write mode a
+    -- popup would become a topmost overlay and release the pen to the reader
+    -- for its whole lifetime (and strand the toolbar contact).
+    if page and page ~= self:getCurrentPage() and not self.enabled then
+        UIManager:show(InfoMessage:new{
+            text = T(_("Undid ink change on page %1."), page),
+            timeout = 2,
+        })
+    end
 end
 
 function KoWriter:clearPage()
@@ -679,7 +869,7 @@ function KoWriter:clearPage()
     end
     self.strokes = keep
     self:rebuildPageIndex()
-    table.insert(self.undo_stack, { type = "delete", strokes = removed })
+    self:pushUndo({ type = "delete", strokes = removed })
     self:saveStrokes()
     self:requestRefresh(true)
 end
@@ -688,6 +878,9 @@ function KoWriter:clearAll()
     self.strokes = {}
     self.page_strokes = {}
     self.undo_stack = {}
+    -- An explicit "delete everything" from the user re-arms saving after a
+    -- failed load (see loadStrokes/saveStrokes).
+    self.load_failed = false
     self:saveStrokes()
     self:requestRefresh(true)
 end
@@ -723,67 +916,283 @@ end
 
 function KoWriter:hasStrokesOnCurrentPage()
     local indices = self.page_strokes[self:getCurrentPage()]
-    return indices and #indices > 0
+    -- Must be a real boolean: menu enabled_func treats nil as "enabled", which
+    -- left "Clear this page" tappable on inkless pages (seen on device).
+    return indices ~= nil and #indices > 0
 end
 
 -- --- Persistence -------------------------------------------------------------
 
+-- Where ink lives: the same sidecar directory family DocSettings:flush uses.
+-- doc_sidecar_dir is always "<book>.sdr beside the book", but the user may
+-- have moved metadata to koreader/docsettings/ or the hash location; follow
+-- that choice so ink sits with the rest of the book's metadata.
 function KoWriter:getStrokesFilePath()
     if not (self.ui and self.ui.doc_settings) then return nil end
-    local dir = self.ui.doc_settings.doc_sidecar_dir
+    local ds = self.ui.doc_settings
+    local loc = G_reader_settings
+        and G_reader_settings:readSetting("document_metadata_folder") or "doc"
+    local dir = ds[loc .. "_sidecar_dir"] or ds.doc_sidecar_dir
     if not dir then return nil end
     return dir .. "/kowriter_strokes.lua"
+end
+
+-- Strict shape check before trusting file contents: a malformed stroke (e.g.
+-- nil page) would otherwise crash rebuildPageIndex inside init().
+local function validateStrokeData(data)
+    if type(data) ~= "table" or type(data.strokes) ~= "table" then return false end
+    for _, s in ipairs(data.strokes) do
+        if type(s) ~= "table" or type(s.page) ~= "number"
+                or type(s.points) ~= "table" then
+            return false
+        end
+        for _, p in ipairs(s.points) do
+            if type(p) ~= "table" or type(p.x) ~= "number"
+                    or type(p.y) ~= "number" then
+                return false
+            end
+        end
+    end
+    return true
+end
+
+-- Show a message now, or queue it if the reader isn't on screen yet: showing
+-- from init() would stack the popup BELOW the ReaderUI being constructed, so
+-- it would only surface (stale and unexplained) after closing the book.
+function KoWriter:notify(text)
+    if self._reader_ready then
+        UIManager:show(InfoMessage:new{ text = text })
+    else
+        self._pending_msg = text
+    end
+end
+
+-- Read one stroke file. Returns "newer" (format from a newer build),
+-- a stroke-data table, false (present but unreadable), or nil (absent).
+local function readStrokeFile(p)
+    local f = io.open(p, "r")
+    if not f then return nil end
+    f:close()
+    local ok, data = pcall(dofile, p)
+    if ok and type(data) == "table" and type(data.version) == "number"
+            and data.version > STROKES_FORMAT_VERSION then
+        return "newer"
+    end
+    if ok and validateStrokeData(data) then return data end
+    return false
 end
 
 function KoWriter:loadStrokes()
     local path = self:getStrokesFilePath()
     if not path then return end
-    local f = io.open(path, "r")
-    if not f then
-        self.strokes = {}
-        self.page_strokes = {}
+    self.strokes = {}
+    self.page_strokes = {}
+    self._migrate_from = nil
+
+    local primary = readStrokeFile(path)
+    if primary == "newer" then
+        -- Written by a newer KoWriter: leave the file strictly alone.
+        logger.warn("KoWriter: strokes file has a newer format version")
+        self.load_failed = true
         self.strokes_loaded = true
+        self:notify(_("This book's ink was saved by a newer version of KoWriter and can't be read here. It will not be modified."))
         return
     end
-    f:close()
-    local ok, data = pcall(dofile, path)
-    if ok and type(data) == "table" and data.strokes then
-        self.strokes = data.strokes
+    if type(primary) == "table" then
+        self.strokes = primary.strokes
         self:rebuildPageIndex()
+        self.load_failed = false
+        self.strokes_loaded = true
         logger.info("KoWriter: loaded", #self.strokes, "strokes")
-    else
-        logger.warn("KoWriter: failed to load strokes:", tostring(data))
-        self.strokes = {}
-        self.page_strokes = {}
+        return
     end
+    if primary == false then
+        -- Present but unreadable. Set it aside (recoverable), then try the
+        -- .old backup kept by the last successful save.
+        local ok_b, berr = os.rename(path, path .. ".bad")
+        if not ok_b then
+            logger.warn("KoWriter: could not set corrupt strokes file aside:", berr)
+        end
+        local backup = readStrokeFile(path .. ".old")
+        if type(backup) == "table" then
+            self.strokes = backup.strokes
+            self:rebuildPageIndex()
+            self.load_failed = false
+            self.strokes_loaded = true
+            logger.warn("KoWriter: strokes file unreadable; restored",
+                #self.strokes, "strokes from backup")
+            self:notify(T(_("This book's ink file was unreadable, so KoWriter restored the previous save (your newest strokes may be missing). The unreadable file was kept as:\n%1"),
+                path .. ".bad"))
+            return
+        end
+        -- No usable backup: refuse to save until the user explicitly clears —
+        -- saving now would replace their ink with the empty set we fell back to.
+        self.load_failed = true
+        self.strokes_loaded = true
+        self:notify(T(_([[KoWriter could not read this book's saved ink.
+The unreadable file was kept as:
+%1
+
+You can restore that file manually, or use "Clear all ink in this book" to start over. Until then, new ink will not be saved for this book.]]),
+            path .. ".bad"))
+        return
+    end
+    -- Nothing at the configured location: fall back to the legacy
+    -- beside-the-book sidecar (ink saved before the metadata-folder setting
+    -- was honored). It is set aside after the first successful save at the
+    -- new location, so a later settings flip can't resurrect a stale copy.
+    local legacy = self.ui.doc_settings.doc_sidecar_dir
+        and self.ui.doc_settings.doc_sidecar_dir .. "/kowriter_strokes.lua"
+    if legacy and legacy ~= path then
+        local ldata = readStrokeFile(legacy)
+        if type(ldata) == "table" then
+            self.strokes = ldata.strokes
+            self:rebuildPageIndex()
+            self._migrate_from = legacy
+            logger.info("KoWriter: loaded", #self.strokes,
+                "strokes from legacy sidecar; migrating on next save")
+        end
+    end
+    self.load_failed = false
     self.strokes_loaded = true
 end
 
+function KoWriter:warnSaveFailedOnce(err)
+    if self._save_warned then return end
+    self._save_warned = true
+    UIManager:show(InfoMessage:new{
+        text = T(_("KoWriter could not save ink:\n%1\n\nYour ink is kept in memory for now but may be lost when the book closes."),
+            tostring(err)),
+    })
+end
+
 function KoWriter:saveStrokes()
+    if self._save_cb then
+        UIManager:unschedule(self._save_cb)
+    end
+    self._save_scheduled = false
     local path = self:getStrokesFilePath()
     if not path then return end
+    -- Never overwrite a file we could not read (see loadStrokes); clearAll()
+    -- re-arms saving as the explicit user decision.
+    if self.load_failed then return end
     -- Avoid clobbering an existing file with an empty set before we ever loaded.
     if #self.strokes == 0 and not self.strokes_loaded then return end
-    local dir = self.ui.doc_settings.doc_sidecar_dir
-    if dir then
-        local ok, err = lfs.mkdir(dir)
-        if not ok and err ~= "File exists" then
-            logger.warn("KoWriter: mkdir sidecar failed:", err)
+    local dir = path:match("(.*)/")
+    if dir and not lfs.attributes(dir, "mode") then
+        -- The "dir"/"hash" metadata locations are several levels deep; create
+        -- the whole chain (lfs.mkdir only makes one level).
+        local ok, err = util.makePath(dir)
+        if not ok then
+            logger.warn("KoWriter: could not create sidecar dir:", err)
         end
     end
-    local f, err = io.open(path, "w")
+    -- Atomic replace (same pattern as DocSettings:flush): write a temp file,
+    -- verify every write, keep the previous file as .old, rename into place.
+    -- A crash or full disk mid-save can no longer destroy the existing ink.
+    local tmp = path .. ".tmp"
+    local f, err = io.open(tmp, "w")
     if not f then
         logger.err("KoWriter: cannot write strokes:", err)
+        self:warnSaveFailedOnce(err)
         return
     end
-    f:write("return " .. dump({ version = 1, strokes = self.strokes }))
-    f:close()
+    local ok_w, werr = f:write("return "
+        .. dump({ version = STROKES_FORMAT_VERSION, strokes = self.strokes }))
+    local ok_c, cerr = f:close()
+    if not ok_w or not ok_c then
+        logger.err("KoWriter: stroke write failed:", werr or cerr)
+        os.remove(tmp)
+        self:warnSaveFailedOnce(werr or cerr)
+        return
+    end
+    local had_prev = lfs.attributes(path, "mode") == "file"
+    if had_prev then
+        os.remove(path .. ".old")
+        local ok_o, oerr = os.rename(path, path .. ".old")
+        if not ok_o then
+            logger.warn("KoWriter: could not keep .old backup:", oerr)
+            had_prev = false
+        end
+    end
+    local ok_r, rerr = os.rename(tmp, path)
+    if not ok_r then
+        logger.err("KoWriter: stroke rename failed:", rerr)
+        -- Roll the backup straight back so a readable file stays in place —
+        -- otherwise the next load would see "never saved" and a later save
+        -- would delete the .old holding the only good copy.
+        if had_prev then
+            os.rename(path .. ".old", path)
+        end
+        os.remove(tmp)
+        self:warnSaveFailedOnce(rerr)
+        return
+    end
+    -- Ink read from the legacy beside-the-book file is now safely written at
+    -- the configured location; set the legacy copy aside so a later settings
+    -- flip can't load a stale version over this one.
+    if self._migrate_from and self._migrate_from ~= path then
+        os.remove(self._migrate_from .. ".migrated")
+        local ok_m, merr = os.rename(self._migrate_from,
+            self._migrate_from .. ".migrated")
+        if ok_m then
+            self._migrate_from = nil
+        else
+            logger.warn("KoWriter: could not set legacy sidecar aside:", merr)
+        end
+    end
 end
 
 -- --- Lifecycle ---------------------------------------------------------------
 
 function KoWriter:onReaderReady()
+    self._reader_ready = true
     if not self.strokes_loaded then self:loadStrokes() end
+    if self._pending_msg then
+        UIManager:show(InfoMessage:new{ text = self._pending_msg })
+        self._pending_msg = nil
+    end
+end
+
+-- Rotation / resize invalidates toolbar geometry (computed from screen width)
+-- for both painting and hit-testing.
+function KoWriter:onSetRotationMode()
+    if self.enabled then
+        self:computeToolbar()
+        self:requestRefresh(true)
+    end
+end
+
+function KoWriter:onScreenResize()
+    if self.enabled then
+        self:computeToolbar()
+        self:requestRefresh(true)
+    end
+end
+
+-- In continuous/scroll view one page number spans many scroll positions, so
+-- screen-space ink cannot follow the text. Warn once instead of failing silently.
+function KoWriter:isScrollMode()
+    if self.ui.paging then
+        return self.view.page_scroll == true
+    end
+    return self.view.view_mode == "scroll"
+end
+
+-- Gate enabling on a one-time scroll-view confirmation. A ConfirmBox (not a
+-- timed InfoMessage after enabling): a popup shown over live write mode would
+-- be a topmost overlay and release the pen to the reader until it timed out.
+function KoWriter:confirmScrollMode(proceed)
+    if self._scroll_warned then return proceed() end
+    local ok, scroll = pcall(function() return self:isScrollMode() end)
+    if not ok or not scroll then return proceed() end
+    self._scroll_warned = true
+    local ConfirmBox = require("ui/widget/confirmbox")
+    UIManager:show(ConfirmBox:new{
+        text = _("You are in continuous/scroll view: ink is pinned to the screen position where it was drawn and will not follow the text as it scrolls. Page view works best for ink.\n\nEnable write mode anyway?"),
+        ok_text = _("Enable"),
+        ok_callback = proceed,
+    })
 end
 
 function KoWriter:onPageUpdate()
@@ -803,6 +1212,11 @@ end
 
 function KoWriter:onSuspend()
     self:flushCurrentStroke()
+    -- A contact interrupted by suspend will never deliver its lift; don't
+    -- come back from sleep with the hook still swallowing everything.
+    if self._pending_unhook then
+        self:removeInputHook()
+    end
     self:saveStrokes()
 end
 
@@ -872,7 +1286,15 @@ function KoWriter:addToMainMenu(menu_items)
                 text = _("Write mode"),
                 help_text = _("When on, the pen/finger draws on the page and normal reading gestures are suspended. Use the on-page toolbar's Done button (or this toggle) to leave.\n\nTip: for one-tap access, map \"KoWriter: toggle write mode\" to a gesture or a hardware key under Settings (gear) -> Taps and gestures -> Gesture manager."),
                 checked_func = function() return self.enabled end,
-                callback = function() self:setEnabled(not self.enabled) end,
+                callback = function()
+                    if self.enabled then
+                        self:setEnabled(false)
+                    else
+                        self:confirmScrollMode(function()
+                            self:setEnabled(true)
+                        end)
+                    end
+                end,
                 separator = true,
             },
             {
@@ -925,8 +1347,12 @@ function KoWriter:addToMainMenu(menu_items)
                 callback = function() self:clearPage() end,
             },
             {
+                -- Also enabled after a failed load: the recovery message
+                -- points here, and it must be reachable with zero strokes.
                 text = _("Clear all ink in this book"),
-                enabled_func = function() return #self.strokes > 0 end,
+                enabled_func = function()
+                    return #self.strokes > 0 or self.load_failed
+                end,
                 callback = function(touchmenu_instance)
                     local ConfirmBox = require("ui/widget/confirmbox")
                     UIManager:show(ConfirmBox:new{
@@ -952,7 +1378,7 @@ end
 function KoWriter:showStatus()
     local page = self:getCurrentPage()
     local on_page = self.page_strokes[page] and #self.page_strokes[page] or 0
-    local hooked = self._orig_feedEvent ~= nil
+    local hooked = self:isHookActive()
     UIManager:show(InfoMessage:new{
         text = T(_([[KoWriter
 
