@@ -95,6 +95,7 @@ the ink too.
 
 By default both finger and stylus draw, because stock Android doesn't tell
 KOReader which is which. To make the pen draw while your palm is ignored, apply
-the small core patch in `patches/input_android-tooltype-patch.md`, then enable
-**KoWriter → Pen only (ignore finger)**. It's optional and advanced (it edits
-KOReader's bundled input code) — the plugin works fine without it.
+the small core patch in `patches/input_android-tooltype-patch.md`. Once the
+device reports tool types, KoWriter ignores finger/palm touches **automatically**
+— there is no setting to flip. It's optional and advanced (it edits KOReader's
+bundled input code) — the plugin works fine without it.

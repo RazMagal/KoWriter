@@ -140,6 +140,11 @@ or read `koreader/crash.log`. The lines `KoWriter: input hook installed` and
 - **No pressure / tilt** (stock Android drops it before KOReader sees it).
 - **Ink is screen‑space per page**, so font/zoom/rotation changes can misalign
   existing EPUB ink.
+- **Continuous/scroll view is not supported for ink**: one page number spans
+  many scroll positions, so ink stays pinned to the screen position where it was
+  drawn and does not follow the text. When you enable write mode from the menu
+  in scroll view, KoWriter asks once before enabling; use page view for
+  annotating.
 - **Latency** is KOReader's normal e‑ink refresh, not Onyx's proprietary fast
   pen layer — smooth, but not as instant as the native notes app.
 - While write mode is on, **all** touch gestures are suspended (by design); use
